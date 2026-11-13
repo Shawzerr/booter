@@ -241,6 +241,20 @@ const API = process.env.SCANNER_API_URL
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Ralentissement adaptatif : double après chaque rate limit (max x16), redescend peu à peu après chaque succès.
+const pace = { mult: 1 };
+
+/** Attente interruptible par Ctrl+C, avec compte à rebours si `label` est fourni. */
+async function wait(ms, stop, label) {
+  const end = Date.now() + ms;
+  while (!stop.requested) {
+    const left = end - Date.now();
+    if (left <= 0) return;
+    if (label) process.stdout.write(`\r\x1b[K${C.y}! ${label} — reprise dans ${fmtDuration(left / 1000, true)} (Ctrl+C pour arrêter)${C.x}`);
+    await sleep(Math.min(left, 1000));
+  }
+}
+
 /** Retourne true (pris) / false (libre). Gère le rate limit (429). */
 async function isTaken(username, stop) {
   for (let attempt = 0; attempt < 8; attempt++) {
@@ -263,9 +277,11 @@ async function isTaken(username, stop) {
 
     if (res.status === 429) {
       const body = await res.json().catch(() => ({}));
-      const wait = Math.ceil(((body.retry_after ?? Number(res.headers.get('retry-after'))) || 10) * 1000) + 500;
-      log(`rate limit — pause ${(wait / 1000).toFixed(1)} s`);
-      await sleep(wait);
+      const ms = Math.ceil(((body.retry_after ?? Number(res.headers.get('retry-after'))) || 10) * 1000) + 500;
+      pace.mult = Math.min(pace.mult * 2, 16);
+      log(`rate limit de Discord (${fmtDuration(ms / 1000, true)}) — rythme ralenti x${pace.mult}`);
+      await wait(ms, stop, 'rate limit');
+      process.stdout.write('\n');
       continue;
     }
     if (res.status === 400) {
@@ -279,6 +295,7 @@ async function isTaken(username, stop) {
       continue;
     }
     const data = await res.json();
+    pace.mult = Math.max(1, pace.mult * 0.95);
     if (typeof data.taken !== 'boolean') throw new Error(`Réponse inattendue : ${JSON.stringify(data)}`);
     return data.taken;
   }
@@ -289,7 +306,7 @@ async function isTaken(username, stop) {
 /** Envoie un message sur le webhook. Ne fait jamais planter le scan. */
 async function sendWebhook(url, payload) {
   if (!url) return;
-  for (let attempt = 0; attempt < 5; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const res = await fetch(url, {
         method: 'POST',
@@ -305,7 +322,7 @@ async function sendWebhook(url, payload) {
       return;
     } catch (e) {
       log(`webhook : ${e.message}`);
-      await sleep(2000);
+      await sleep(1000);
     }
   }
 }
@@ -410,9 +427,9 @@ async function main() {
       const rate = n / ((Date.now() - t0) / 1000);
       process.stdout.write(
         `\r\x1b[K${C.d}[${done.size}/${total}] ${name} ${taken ? C.r + 'pris' : C.g + 'libre'}${C.d}` +
-        `  | ${free} dispo  | ${rate.toFixed(2)} req/s${shape ? `  | forme ${shape}` : ''}${C.x}`
+        `  | ${free} dispo  | ${rate.toFixed(2)} req/s${pace.mult > 1.05 ? `  | ralenti x${pace.mult.toFixed(1)}` : ''}${shape ? `  | forme ${shape}` : ''}${C.x}`
       );
-      await sleep(opt.delay + Math.random() * opt.jitter);
+      await wait((opt.delay + Math.random() * opt.jitter) * pace.mult, stop);
     }
   } finally {
     fs.closeSync(checkedFd);
@@ -429,10 +446,11 @@ async function main() {
   });
 }
 
-function fmtDuration(s) {
+function fmtDuration(s, withSeconds = false) {
   if (!isFinite(s)) return '∞';
+  s = Math.ceil(s);
   const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
-  return [d && `${d} j`, h && `${h} h`, `${m} min`].filter(Boolean).join(' ');
+  return [d && `${d} j`, h && `${h} h`, (m || !withSeconds) && `${m} min`, withSeconds && `${s % 60} s`].filter(Boolean).join(' ');
 }
 
 main().catch((e) => { console.error(`\nErreur : ${e.message}`); process.exit(1); });
