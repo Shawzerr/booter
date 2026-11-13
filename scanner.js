@@ -256,6 +256,8 @@ function netSignature() {
   return out.sort().join('|');
 }
 const signals = { retryNow: false };
+// Test de rate limit : la prochaine requête sert de sonde (au démarrage, après une attente, une reconnexion ou Entrée).
+const probe = { active: true, initial: true };
 
 /**
  * Attente interruptible. Avec `label` (attente de rate limit), elle se termine aussi quand
@@ -264,14 +266,18 @@ const signals = { retryNow: false };
  */
 async function wait(ms, stop, label) {
   const end = Date.now() + ms;
-  const sig0 = label ? netSignature() : null;
+  let lastSig = label ? netSignature() : null;
+  let changedAt = 0;
   if (label) signals.retryNow = false;
   while (!stop.requested) {
     const left = end - Date.now();
     if (left <= 0) return undefined;
     if (label) {
       if (signals.retryNow) { signals.retryNow = false; return 'enter'; }
-      if (netSignature() !== sig0) return 'network';
+      // Reconnexion : la connexion a changé (ou coupé puis revenu) et reste stable 2 s avec une adresse.
+      const sig = netSignature();
+      if (sig !== lastSig) { lastSig = sig; changedAt = Date.now(); }
+      if (changedAt && sig !== '' && Date.now() - changedAt >= 2000) return 'network';
       process.stdout.write(`\r\x1b[K${C.y}! ${label} — reprise dans ${fmtDuration(left / 1000, true)} (Entrée = réessayer maintenant · Ctrl+C = arrêter)${C.x}`);
     }
     await sleep(Math.min(left, 1000));
@@ -303,7 +309,8 @@ async function isTaken(username, stop) {
       const body = await res.json().catch(() => ({}));
       const ms = Math.ceil(((body.retry_after ?? Number(res.headers.get('retry-after'))) || 10) * 1000) + 500;
       pace.mult = Math.min(pace.mult * 2, 16);
-      log(`rate limit de Discord (${fmtDuration(ms / 1000, true)}) — rythme ralenti x${pace.mult}`);
+      log(`${probe.active && !probe.initial ? 'toujours limité' : 'rate limit de Discord'} (${fmtDuration(ms / 1000, true)}) — rythme ralenti x${pace.mult}`);
+      probe.initial = false;
       if (!isTaken.hinted) {
         isTaken.hinted = true;
         log('Astuce : si tu changes de connexion, le scanner le détecte et reprend tout seul (ou appuie sur Entrée).');
@@ -312,8 +319,11 @@ async function isTaken(username, stop) {
       process.stdout.write('\n');
       if (why) {
         pace.mult = 1; // nouvelle connexion : on repart à vitesse normale
-        log(why === 'network' ? 'changement de connexion détecté — reprise immédiate' : 'reprise demandée');
+        log(why === 'network' ? 'nouvelle connexion détectée — test du rate limit…' : 'test du rate limit…');
+      } else {
+        log('attente terminée — test du rate limit…');
       }
+      probe.active = true; // la prochaine requête vérifie si on est encore limité
       continue;
     }
     if (res.status === 400) {
@@ -328,6 +338,10 @@ async function isTaken(username, stop) {
     }
     const data = await res.json();
     pace.mult = Math.max(1, pace.mult * 0.95);
+    if (probe.active) {
+      log(probe.initial ? '✔ connexion OK, pas de rate limit — le scan démarre' : '✔ plus limité — le scan reprend');
+      probe.active = false; probe.initial = false;
+    }
     if (typeof data.taken !== 'boolean') throw new Error(`Réponse inattendue : ${JSON.stringify(data)}`);
     return data.taken;
   }

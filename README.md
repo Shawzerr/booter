@@ -45,6 +45,6 @@ Ctrl+C arrête proprement ; relancer la commande reprend là où le scan s'étai
 
 Si Discord te limite (attente de plusieurs minutes), le scanner affiche un compte à rebours et ralentit son rythme.
 Pendant l'attente :
-- **change de connexion** (Wi-Fi, partage de connexion…) : il le détecte et reprend tout seul ;
+- **change de connexion** (Wi-Fi, partage de connexion, coupure puis retour…) : il le détecte, envoie une requête de test et affiche « toujours limité » ou « plus limité » ;
 - **Entrée** : réessaie tout de suite ;
 - **Ctrl+C** : arrête proprement. Ta progression est sauvegardée dans `results/`.
