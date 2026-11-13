@@ -14,6 +14,16 @@
 const fs = require('fs');
 const path = require('path');
 
+// ───────────────────────── .env (optionnel) ─────────────────────────
+try {
+  for (const line of fs.readFileSync(path.join(__dirname, '.env'), 'utf8').split('\n')) {
+    const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$/);
+    if (m && !(m[1] in process.env)) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
+  }
+} catch { /* pas de .env */ }
+
+const WEBHOOK_RE = /^https?:\/\/(localhost(:\d+)?|127\.0\.0\.1(:\d+)?|(ptb\.|canary\.)?discord(app)?\.com)\/api\/webhooks\/\d+\/[\w-]+$/;
+
 // ───────────────────────── Options ─────────────────────────
 const HELP = `
 Discord username scanner
@@ -21,7 +31,7 @@ Discord username scanner
   node scanner.js [options]
 
 Options
-  --len <3|4|3,4>      Longueurs à scanner                (défaut : 3,4)
+  --len <3|4|3,4>      Longueurs à scanner                (défaut : 2,3)
   --charset <set>      letters  = a-z
                        alnum    = a-z + 0-9
                        all      = a-z 0-9 _ .             (défaut : letters)
@@ -29,6 +39,8 @@ Options
   --jitter <ms>        Aléa ajouté à la pause             (défaut : 500)
   --shuffle            Ordre aléatoire au lieu de a, b, c…
   --list <fichier>     Scanner uniquement les noms d'un fichier (1 par ligne)
+  --webhook <url>      Webhook Discord qui reçoit chaque nom libre
+                       (ou variable DISCORD_WEBHOOK_URL / fichier .env)
   --out <dossier>      Dossier des résultats              (défaut : ./results)
   --limit <n>          S'arrêter après n requêtes
   --fresh              Ignorer la sauvegarde et tout recommencer
@@ -43,9 +55,10 @@ Ctrl+C arrête proprement ; relancez la même commande pour reprendre.
 
 function parseArgs(argv) {
   const o = {
-    len: [3, 4], charset: 'letters', delay: 1500, jitter: 500,
+    len: [2, 3], charset: 'letters', delay: 1500, jitter: 500,
     shuffle: false, list: null, out: path.join(__dirname, 'results'),
     limit: Infinity, fresh: false,
+    webhook: process.env.DISCORD_WEBHOOK_URL || null,
   };
   const need = (i, name) => {
     if (argv[i + 1] === undefined) die(`Valeur manquante pour ${name}`);
@@ -61,6 +74,7 @@ function parseArgs(argv) {
       case '--jitter': o.jitter = Number(need(i++, a)); break;
       case '--shuffle': o.shuffle = true; break;
       case '--list': o.list = need(i++, a); break;
+      case '--webhook': o.webhook = need(i++, a); break;
       case '--out': o.out = path.resolve(need(i++, a)); break;
       case '--limit': o.limit = Number(need(i++, a)); break;
       case '--fresh': o.fresh = true; break;
@@ -69,6 +83,7 @@ function parseArgs(argv) {
   }
   if (o.len.some((n) => !Number.isInteger(n) || n < 2 || n > 6)) die('--len : entiers entre 2 et 6');
   if (![ 'letters', 'alnum', 'all' ].includes(o.charset)) die('--charset : letters | alnum | all');
+  if (o.webhook && !WEBHOOK_RE.test(o.webhook)) die('Webhook invalide (attendu : https://discord.com/api/webhooks/<id>/<token>)');
   if (!(o.delay >= 0) || !(o.jitter >= 0)) die('--delay / --jitter doivent être >= 0');
   return o;
 }
@@ -152,6 +167,41 @@ async function isTaken(username, stop) {
   throw new Error(`Trop d'échecs consécutifs sur "${username}"`);
 }
 
+// ───────────────────────── Webhook Discord ─────────────────────────
+/** Envoie un message sur le webhook. Ne fait jamais planter le scan. */
+async function sendWebhook(url, payload) {
+  if (!url) return;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (res.status === 429) {
+        const body = await res.json().catch(() => ({}));
+        await sleep(Math.ceil((body.retry_after ?? 2) * 1000) + 250);
+        continue;
+      }
+      if (!res.ok) { log(`webhook : HTTP ${res.status}`); return; }
+      return;
+    } catch (e) {
+      log(`webhook : ${e.message}`);
+      await sleep(2000);
+    }
+  }
+}
+
+const notifyFree = (url, name) => sendWebhook(url, {
+  username: 'Name Scanner',
+  embeds: [{
+    title: `✅ \`${name}\` est disponible`,
+    description: `Pseudo de **${name.length} caractères** libre sur Discord.`,
+    color: 0x57f287,
+    timestamp: new Date().toISOString(),
+  }],
+});
+
 // ───────────────────────── Affichage ─────────────────────────
 const C = { g: '\x1b[32m', r: '\x1b[31m', y: '\x1b[33m', d: '\x1b[2m', x: '\x1b[0m' };
 const log = (m) => process.stdout.write(`\r\x1b[K${C.y}! ${m}${C.x}\n`);
@@ -199,6 +249,11 @@ async function main() {
     console.log(`\n${C.y}Arrêt demandé… sauvegarde en cours (Ctrl+C à nouveau pour forcer)${C.x}`);
   });
 
+  await sendWebhook(opt.webhook, {
+    username: 'Name Scanner',
+    content: `🔎 Scan démarré — ${remaining} noms à tester (${opt.list ? 'liste' : `longueurs ${opt.len.join('/')}, ${opt.charset}`}).`,
+  });
+
   const checkedFd = fs.openSync(checkedFile, 'a');
   const availFd = fs.openSync(availableFile, 'a');
   let n = 0, free = 0;
@@ -217,6 +272,7 @@ async function main() {
         free++;
         fs.writeSync(availFd, name + '\n');
         process.stdout.write(`\r\x1b[K${C.g}✔ ${name} est DISPONIBLE${C.x}\n`);
+        await notifyFree(opt.webhook, name);
       }
       const rate = n / ((Date.now() - t0) / 1000);
       process.stdout.write(
@@ -230,6 +286,10 @@ async function main() {
     fs.closeSync(availFd);
   }
   console.log(`\n\nTerminé : ${n} testés, ${free} disponibles → ${availableFile}`);
+  await sendWebhook(opt.webhook, {
+    username: 'Name Scanner',
+    content: `🏁 Scan ${stop.requested ? 'interrompu' : 'terminé'} — ${n} testés, **${free}** disponibles.`,
+  });
 }
 
 function fmtDuration(s) {
