@@ -24,8 +24,9 @@ Ne partage jamais l'URL du webhook : quiconque la possède peut poster dans ton 
 ## Utilisation
 
 ```bash
-node scanner.js                    # 2 et 3 lettres (a-z)
+node scanner.js                    # 2 et 3 caractères, toutes combinaisons (a-z 0-9 _ .)
 node scanner.js --len 2,3,4        # ajoute les 4 lettres (très long)
+node scanner.js --charset letters  # seulement a-z
 node scanner.js --charset alnum    # lettres + chiffres
 node scanner.js --shuffle          # ordre aléatoire
 node scanner.js --help             # toutes les options

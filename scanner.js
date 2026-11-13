@@ -34,7 +34,7 @@ Options
   --len <3|4|3,4>      Longueurs à scanner                (défaut : 2,3)
   --charset <set>      letters  = a-z
                        alnum    = a-z + 0-9
-                       all      = a-z 0-9 _ .             (défaut : letters)
+                       all      = a-z 0-9 _ .  (toutes les combinaisons Discord)             (défaut : all)
   --delay <ms>         Pause entre deux requêtes          (défaut : 1500)
   --jitter <ms>        Aléa ajouté à la pause             (défaut : 500)
   --shuffle            Ordre aléatoire au lieu de a, b, c…
@@ -55,7 +55,7 @@ Ctrl+C arrête proprement ; relancez la même commande pour reprendre.
 
 function parseArgs(argv) {
   const o = {
-    len: [2, 3], charset: 'letters', delay: 1500, jitter: 500,
+    len: [2, 3], charset: 'all', delay: 1500, jitter: 500,
     shuffle: false, list: null, out: path.join(__dirname, 'results'),
     limit: Infinity, fresh: false,
     webhook: process.env.DISCORD_WEBHOOK_URL || null,
@@ -230,6 +230,8 @@ async function main() {
     if (bad.length) die(`Noms invalides dans ${opt.list} : ${bad.slice(0, 5).join(', ')}…`);
     source = lines;
   } else {
+    const combos = opt.len.reduce((t, n) => t + Math.pow(SETS[opt.charset].length, n), 0);
+    if (opt.shuffle && combos > 5e6) die(`--shuffle limité à 5 millions de combinaisons (ici ${combos.toLocaleString('fr-FR')}). Retire --shuffle ou réduis --len.`);
     const gen = generate(opt.len, SETS[opt.charset]);
     source = opt.shuffle ? shuffled(gen) : gen;
   }
