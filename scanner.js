@@ -31,7 +31,7 @@ Discord username scanner
   node scanner.js [options]
 
 Options
-  --len <3|4|3,4>      Longueurs à scanner                (défaut : 2,3)
+  --len <3|4|3,4>      Longueurs à scanner                (défaut : 3,4)
   --charset <set>      letters  = a-z
                        alnum    = a-z + 0-9
                        all      = a-z 0-9 _ .  (toutes les combinaisons Discord)             (défaut : all)
@@ -58,7 +58,7 @@ Ctrl+C arrête proprement ; relancez la même commande pour reprendre.
 
 function parseArgs(argv) {
   const o = {
-    len: [2, 3], charset: 'all', delay: 1500, jitter: 500,
+    len: [3, 4], charset: 'all', delay: 1500, jitter: 500,
     order: 'smart', list: null, out: path.join(__dirname, 'results'),
     limit: Infinity, fresh: false,
     webhook: process.env.DISCORD_WEBHOOK_URL || null,
