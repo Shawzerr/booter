@@ -23,11 +23,15 @@ Ne partage jamais l'URL du webhook : quiconque la possède peut poster dans ton 
 
 ## Utilisation
 
+Par défaut (`--style mix`), le scanner ignore les noms qui ressemblent à des mots (`sova`, `nova`…)
+et cherche des mélanges comme `_tr`, `k7f`, `x.q`, `qzk` (1 symbole `_` ou `.` maximum), bien plus souvent libres.
+
 ```bash
 node scanner.js                    # 3 et 4 caractères, toutes combinaisons (a-z 0-9 _ .)
 node scanner.js --len 3             # seulement 3 caractères (le plus rapide)
 node scanner.js --charset letters  # seulement a-z
 node scanner.js --charset alnum    # lettres + chiffres
+node scanner.js --style any        # inclut aussi les noms prononçables (nova, kiro…)
 node scanner.js --order smart      # défaut : apprend quelles formes de pseudos sont les plus souvent libres
 node scanner.js --order random     # ordre aléatoire uniforme
 node scanner.js --order seq        # ordre alphabétique aaa, aab, aac…

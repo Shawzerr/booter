@@ -37,6 +37,9 @@ Options
                        all      = a-z 0-9 _ .  (toutes les combinaisons Discord)             (défaut : all)
   --delay <ms>         Pause entre deux requêtes          (défaut : 1500)
   --jitter <ms>        Aléa ajouté à la pause             (défaut : 500)
+  --style <mode>       mix = ignore les noms-mots (sova, nova…), garde les mélanges
+                             du type _tr, k7f, x.q, qzk ; 1 symbole max (défaut)
+                       any = tout, y compris les noms prononçables
   --order <mode>       smart  = apprend où se trouvent les noms libres (défaut)
                        random = ordre aléatoire uniforme
                        seq    = ordre alphabétique aaa, aab, aac…
@@ -59,7 +62,7 @@ Ctrl+C arrête proprement ; relancez la même commande pour reprendre.
 function parseArgs(argv) {
   const o = {
     len: [3, 4], charset: 'all', delay: 1500, jitter: 500,
-    order: 'smart', list: null, out: path.join(__dirname, 'results'),
+    order: 'smart', style: 'mix', list: null, out: path.join(__dirname, 'results'),
     limit: Infinity, fresh: false,
     webhook: process.env.DISCORD_WEBHOOK_URL || null,
   };
@@ -75,6 +78,7 @@ function parseArgs(argv) {
       case '--charset': o.charset = need(i++, a); break;
       case '--delay': o.delay = Number(need(i++, a)); break;
       case '--jitter': o.jitter = Number(need(i++, a)); break;
+      case '--style': o.style = need(i++, a); break;
       case '--order': o.order = need(i++, a); break;
       case '--shuffle': o.order = 'random'; break;
       case '--list': o.list = need(i++, a); break;
@@ -86,6 +90,7 @@ function parseArgs(argv) {
     }
   }
   if (o.len.some((n) => !Number.isInteger(n) || n < 2 || n > 6)) die('--len : entiers entre 2 et 6');
+  if (!['mix', 'any'].includes(o.style)) die('--style : mix | any');
   if (!['smart', 'random', 'seq'].includes(o.order)) die('--order : smart | random | seq');
   if (![ 'letters', 'alnum', 'all' ].includes(o.charset)) die('--charset : letters | alnum | all');
   if (o.webhook && !WEBHOOK_RE.test(o.webhook)) die('Webhook invalide (attendu : https://discord.com/api/webhooks/<id>/<token>)');
@@ -119,27 +124,34 @@ function* generate(lengths, chars) {
 }
 
 // ───────────────────────── Sélection intelligente ─────────────────────────
-// Chaque nom a une "forme" : L = lettre, D = chiffre, S = symbole (_ .), ex. "abc" -> LLL,
-// "a_7" -> LSD. Le sélecteur ne reteste jamais un nom déjà testé, et apprend en continu
+// Chaque nom a une "forme" : C = consonne, V = voyelle, D = chiffre, S = symbole (_ .),
+// ex. "_tr" -> SCC, "k7f" -> CDC. Le sélecteur ne reteste jamais un nom déjà testé, et apprend en continu
 // quelles formes donnent le plus de noms libres pour y concentrer ses requêtes
 // (bandit epsilon-greedy), tout en continuant d'explorer les autres.
-const CLASSES = { L: 'abcdefghijklmnopqrstuvwxyz', D: '0123456789', S: '_.' };
-const CLASSES_FOR = { letters: ['L'], alnum: ['L', 'D'], all: ['L', 'D', 'S'] };
-const classOf = (ch) => (ch >= 'a' && ch <= 'z' ? 'L' : ch >= '0' && ch <= '9' ? 'D' : 'S');
+const CLASSES = { C: 'bcdfghjklmnpqrstvwxyz', V: 'aeiou', D: '0123456789', S: '_.' };
+const CLASSES_FOR = { letters: ['C', 'V'], alnum: ['C', 'V', 'D'], all: ['C', 'V', 'D', 'S'] };
+const classOf = (ch) => ('aeiou'.includes(ch) ? 'V' : ch >= 'a' && ch <= 'z' ? 'C' : ch >= '0' && ch <= '9' ? 'D' : 'S');
+// "Nom-mot" : uniquement des lettres, avec au moins une voyelle (sova, nova, kiro…).
+const wordLike = (n) => /^[a-z]+$/.test(n) && /[aeiou]/.test(n);
+// Style "mix" : pas de nom-mot, et au maximum un symbole (_tr, k.f ok ; __c, .___ non).
+const mixOk = (n) => !wordLike(n) && (n.match(/[_.]/g) || []).length <= 1;
+// A priori sur la rareté : symboles et chiffres d'abord, les formes sans voyelle aussi.
+const priorOf = (pattern) => 1 + 2 * (pattern.match(/S/g) || []).length + 0.5 * (pattern.match(/D/g) || []).length + (pattern.includes('V') ? 0 : 1);
 const shapeOf = (name) => [...name].map(classOf).join('');
 
 const gcd = (a, b) => (b ? gcd(b, a % b) : a);
 
-function makeSmartPicker({ lengths, charset, order, done, availableSet, epsilon = 0.2 }) {
+function makeSmartPicker({ lengths, charset, order, style, done, availableSet, epsilon = 0.2 }) {
   // Une entrée par forme. Les noms d'une forme sont parcourus dans un ordre pseudo-aléatoire
   // (permutation affine i -> (a*i + b) mod N) : aucune liste en mémoire, aucun doublon.
   const shapes = new Map();
   const build = (prefix, len) => {
     if (prefix.length === len) {
+      if (style === 'mix' && (/^[CV]+$/.test(prefix) && prefix.includes('V') || (prefix.match(/S/g) || []).length > 1)) return; // forme "mot" ou trop de symboles
       const sets = [...prefix].map((c) => CLASSES[c]);
       const N = sets.reduce((t, st) => t * st.length, 1);
       let a; do { a = 1 + Math.floor(Math.random() * (N - 1 || 1)); } while (gcd(a, N) !== 1);
-      shapes.set(prefix, { pattern: prefix, sets, N, a: BigInt(a), b: BigInt(Math.floor(Math.random() * N)), i: 0, tried: 0, free: 0 });
+      shapes.set(prefix, { pattern: prefix, sets, N, a: BigInt(a), b: BigInt(Math.floor(Math.random() * N)), i: 0, tried: 0, free: 0, prior: priorOf(prefix) });
       return;
     }
     for (const c of CLASSES_FOR[charset]) build(prefix + c, len);
@@ -173,11 +185,12 @@ function makeSmartPicker({ lengths, charset, order, done, availableSet, epsilon 
     if (availableSet.has(name)) sh.free++;
   }
 
-  const score = (sh) => (sh.free + 1) / (sh.tried + 20); // taux de réussite lissé
+  const score = (sh) => (sh.free + sh.prior) / (sh.tried + 20); // taux de réussite lissé + a priori
   let active = [...shapes.values()];
 
   return {
     shapes,
+    total: [...shapes.values()].reduce((t, x) => t + x.N, 0),
     next() {
       while (active.length) {
         let sh;
@@ -254,6 +267,11 @@ async function isTaken(username, stop) {
       log(`rate limit — pause ${(wait / 1000).toFixed(1)} s`);
       await sleep(wait);
       continue;
+    }
+    if (res.status === 400) {
+      // Nom refusé comme invalide par Discord (règles de format) : inutile de réessayer.
+      const body = await res.json().catch(() => ({}));
+      if (body && body.errors) return true;
     }
     if (!res.ok) {
       log(`HTTP ${res.status} pour "${username}" — nouvel essai dans 5 s`);
@@ -337,13 +355,16 @@ async function main() {
     listCount = lines.length;
     picker = makeSequentialPicker(lines, done);
   } else if (opt.order === 'seq') {
-    picker = makeSequentialPicker(generate(opt.len, SETS[opt.charset]), done);
+    const gen = generate(opt.len, SETS[opt.charset]);
+    picker = makeSequentialPicker(opt.style === 'mix' ? (function* () { for (const n of gen) if (mixOk(n)) yield n; })() : gen, done);
   } else {
-    picker = makeSmartPicker({ lengths: opt.len, charset: opt.charset, order: opt.order, done, availableSet });
+    picker = makeSmartPicker({ lengths: opt.len, charset: opt.charset, order: opt.order, style: opt.style, done, availableSet });
   }
 
   const total = opt.list
     ? listCount
+    : picker.total !== undefined
+    ? picker.total
     : opt.len.reduce((s, n) => s + Math.pow(SETS[opt.charset].length, n), 0);
   const remaining = Math.max(0, total - done.size);
   const eta = (remaining * (opt.delay + opt.jitter / 2)) / 1000;
@@ -400,7 +421,7 @@ async function main() {
   console.log(`\n\nTerminé : ${n} testés, ${free} disponibles → ${availableFile}`);
   const best = picker.stats().filter((x) => x.free).slice(0, 5);
   if (best.length) {
-    console.log('Formes les plus rentables : ' + best.map((x) => `${x.pattern} ${x.free}/${x.tried}`).join(' · ') + '  (L=lettre D=chiffre S=_ .)');
+    console.log('Formes les plus rentables : ' + best.map((x) => `${x.pattern} ${x.free}/${x.tried}`).join(' · ') + '  (C=consonne V=voyelle D=chiffre S=_ .)');
   }
   await sendWebhook(opt.webhook, {
     username: 'Name Scanner',
