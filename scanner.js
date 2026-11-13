@@ -37,7 +37,10 @@ Options
                        all      = a-z 0-9 _ .  (toutes les combinaisons Discord)             (défaut : all)
   --delay <ms>         Pause entre deux requêtes          (défaut : 1500)
   --jitter <ms>        Aléa ajouté à la pause             (défaut : 500)
-  --shuffle            Ordre aléatoire au lieu de a, b, c…
+  --order <mode>       smart  = apprend où se trouvent les noms libres (défaut)
+                       random = ordre aléatoire uniforme
+                       seq    = ordre alphabétique aaa, aab, aac…
+  --shuffle            Alias de --order random
   --list <fichier>     Scanner uniquement les noms d'un fichier (1 par ligne)
   --webhook <url>      Webhook Discord qui reçoit chaque nom libre
                        (ou variable DISCORD_WEBHOOK_URL / fichier .env)
@@ -56,7 +59,7 @@ Ctrl+C arrête proprement ; relancez la même commande pour reprendre.
 function parseArgs(argv) {
   const o = {
     len: [2, 3], charset: 'all', delay: 1500, jitter: 500,
-    shuffle: false, list: null, out: path.join(__dirname, 'results'),
+    order: 'smart', list: null, out: path.join(__dirname, 'results'),
     limit: Infinity, fresh: false,
     webhook: process.env.DISCORD_WEBHOOK_URL || null,
   };
@@ -72,7 +75,8 @@ function parseArgs(argv) {
       case '--charset': o.charset = need(i++, a); break;
       case '--delay': o.delay = Number(need(i++, a)); break;
       case '--jitter': o.jitter = Number(need(i++, a)); break;
-      case '--shuffle': o.shuffle = true; break;
+      case '--order': o.order = need(i++, a); break;
+      case '--shuffle': o.order = 'random'; break;
       case '--list': o.list = need(i++, a); break;
       case '--webhook': o.webhook = need(i++, a); break;
       case '--out': o.out = path.resolve(need(i++, a)); break;
@@ -82,6 +86,7 @@ function parseArgs(argv) {
     }
   }
   if (o.len.some((n) => !Number.isInteger(n) || n < 2 || n > 6)) die('--len : entiers entre 2 et 6');
+  if (!['smart', 'random', 'seq'].includes(o.order)) die('--order : smart | random | seq');
   if (![ 'letters', 'alnum', 'all' ].includes(o.charset)) die('--charset : letters | alnum | all');
   if (o.webhook && !WEBHOOK_RE.test(o.webhook)) die('Webhook invalide (attendu : https://discord.com/api/webhooks/<id>/<token>)');
   if (!(o.delay >= 0) || !(o.jitter >= 0)) die('--delay / --jitter doivent être >= 0');
@@ -113,13 +118,108 @@ function* generate(lengths, chars) {
   }
 }
 
-function shuffled(iter) {
-  const arr = [...iter];
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
+// ───────────────────────── Sélection intelligente ─────────────────────────
+// Chaque nom a une "forme" : L = lettre, D = chiffre, S = symbole (_ .), ex. "abc" -> LLL,
+// "a_7" -> LSD. Le sélecteur ne reteste jamais un nom déjà testé, et apprend en continu
+// quelles formes donnent le plus de noms libres pour y concentrer ses requêtes
+// (bandit epsilon-greedy), tout en continuant d'explorer les autres.
+const CLASSES = { L: 'abcdefghijklmnopqrstuvwxyz', D: '0123456789', S: '_.' };
+const CLASSES_FOR = { letters: ['L'], alnum: ['L', 'D'], all: ['L', 'D', 'S'] };
+const classOf = (ch) => (ch >= 'a' && ch <= 'z' ? 'L' : ch >= '0' && ch <= '9' ? 'D' : 'S');
+const shapeOf = (name) => [...name].map(classOf).join('');
+
+const gcd = (a, b) => (b ? gcd(b, a % b) : a);
+
+function makeSmartPicker({ lengths, charset, order, done, availableSet, epsilon = 0.2 }) {
+  // Une entrée par forme. Les noms d'une forme sont parcourus dans un ordre pseudo-aléatoire
+  // (permutation affine i -> (a*i + b) mod N) : aucune liste en mémoire, aucun doublon.
+  const shapes = new Map();
+  const build = (prefix, len) => {
+    if (prefix.length === len) {
+      const sets = [...prefix].map((c) => CLASSES[c]);
+      const N = sets.reduce((t, st) => t * st.length, 1);
+      let a; do { a = 1 + Math.floor(Math.random() * (N - 1 || 1)); } while (gcd(a, N) !== 1);
+      shapes.set(prefix, { pattern: prefix, sets, N, a: BigInt(a), b: BigInt(Math.floor(Math.random() * N)), i: 0, tried: 0, free: 0 });
+      return;
+    }
+    for (const c of CLASSES_FOR[charset]) build(prefix + c, len);
+  };
+  for (const len of lengths) build('', len);
+
+  const decode = (sh, idx) => {
+    let out = '';
+    for (let k = sh.sets.length - 1; k >= 0; k--) {
+      const st = sh.sets[k];
+      out = st[idx % st.length] + out;
+      idx = Math.floor(idx / st.length);
+    }
+    return out;
+  };
+
+  const nextIn = (sh) => {
+    const N = BigInt(sh.N);
+    while (sh.i < sh.N) {
+      const name = decode(sh, Number((sh.a * BigInt(sh.i++) + sh.b) % N));
+      if (isValid(name) && !done.has(name)) return name;
+    }
+    return null;
+  };
+
+  // Rejoue l'historique pour retrouver ce qui a été appris lors des scans précédents.
+  for (const name of done) {
+    const sh = shapes.get(shapeOf(name));
+    if (!sh) continue;
+    sh.tried++;
+    if (availableSet.has(name)) sh.free++;
   }
-  return arr;
+
+  const score = (sh) => (sh.free + 1) / (sh.tried + 20); // taux de réussite lissé
+  let active = [...shapes.values()];
+
+  return {
+    shapes,
+    next() {
+      while (active.length) {
+        let sh;
+        if (order === 'random') {
+          // uniforme sur tous les noms restants : pondéré par la taille de chaque forme
+          let r = Math.random() * active.reduce((t, x) => t + (x.N - x.i), 0);
+          sh = active.find((x) => (r -= x.N - x.i) < 0) || active[active.length - 1];
+        } else if (Math.random() < epsilon) {
+          sh = active[Math.floor(Math.random() * active.length)]; // exploration
+        } else {
+          const best = Math.max(...active.map(score)); // exploitation (égalités -> hasard)
+          const top = active.filter((x) => score(x) >= best - 1e-12);
+          sh = top[Math.floor(Math.random() * top.length)];
+        }
+        const name = nextIn(sh);
+        if (name !== null) return { name, shape: sh.pattern };
+        active = active.filter((x) => x !== sh); // forme épuisée
+      }
+      return null;
+    },
+    record(shape, taken) {
+      const sh = shapes.get(shape);
+      sh.tried++;
+      if (!taken) sh.free++;
+    },
+    stats() {
+      return [...shapes.values()].filter((x) => x.tried).sort((x, y) => y.free / y.tried - x.free / x.tried || y.tried - x.tried);
+    },
+  };
+}
+
+/** Sélecteur simple (--order seq ou --list) : parcourt un itérateur en sautant les noms déjà testés. */
+function makeSequentialPicker(iterable, done) {
+  const it = iterable[Symbol.iterator](); // itération manuelle : un `for…of` + return fermerait le générateur
+  return {
+    next() {
+      for (let r = it.next(); !r.done; r = it.next()) if (!done.has(r.value)) return { name: r.value, shape: null };
+      return null;
+    },
+    record() {},
+    stats: () => [],
+  };
 }
 
 // ───────────────────────── Requête Discord ─────────────────────────
@@ -222,22 +322,28 @@ async function main() {
       : []
   );
 
+  const availableSet = new Set(
+    fs.existsSync(availableFile)
+      ? fs.readFileSync(availableFile, 'utf8').split('\n').filter(Boolean)
+      : []
+  );
+
   // Source des noms
-  let source;
+  let picker, listCount = 0;
   if (opt.list) {
     const lines = fs.readFileSync(opt.list, 'utf8').split('\n').map((s) => s.trim().toLowerCase()).filter(Boolean);
     const bad = lines.filter((n) => !isValid(n) || n.length < 2 || n.length > 32);
     if (bad.length) die(`Noms invalides dans ${opt.list} : ${bad.slice(0, 5).join(', ')}…`);
-    source = lines;
+    listCount = lines.length;
+    picker = makeSequentialPicker(lines, done);
+  } else if (opt.order === 'seq') {
+    picker = makeSequentialPicker(generate(opt.len, SETS[opt.charset]), done);
   } else {
-    const combos = opt.len.reduce((t, n) => t + Math.pow(SETS[opt.charset].length, n), 0);
-    if (opt.shuffle && combos > 5e6) die(`--shuffle limité à 5 millions de combinaisons (ici ${combos.toLocaleString('fr-FR')}). Retire --shuffle ou réduis --len.`);
-    const gen = generate(opt.len, SETS[opt.charset]);
-    source = opt.shuffle ? shuffled(gen) : gen;
+    picker = makeSmartPicker({ lengths: opt.len, charset: opt.charset, order: opt.order, done, availableSet });
   }
 
   const total = opt.list
-    ? source.length
+    ? listCount
     : opt.len.reduce((s, n) => s + Math.pow(SETS[opt.charset].length, n), 0);
   const remaining = Math.max(0, total - done.size);
   const eta = (remaining * (opt.delay + opt.jitter / 2)) / 1000;
@@ -262,13 +368,17 @@ async function main() {
   const t0 = Date.now();
 
   try {
-    for (const name of source) {
+    for (;;) {
       if (stop.requested || n >= opt.limit) break;
-      if (done.has(name)) continue;
+      const pick = picker.next();
+      if (pick === null) break; // plus aucun nom à tester
+      const { name, shape } = pick;
 
       const taken = await isTaken(name, stop);
       if (taken === null) break; // arrêt pendant la requête
       n++;
+      done.add(name);
+      if (shape) picker.record(shape, taken);
       fs.writeSync(checkedFd, name + '\n');
       if (!taken) {
         free++;
@@ -278,8 +388,8 @@ async function main() {
       }
       const rate = n / ((Date.now() - t0) / 1000);
       process.stdout.write(
-        `\r\x1b[K${C.d}[${done.size + n}/${total}] ${name} ${taken ? C.r + 'pris' : C.g + 'libre'}${C.d}` +
-        `  | ${free} dispo  | ${rate.toFixed(2)} req/s${C.x}`
+        `\r\x1b[K${C.d}[${done.size}/${total}] ${name} ${taken ? C.r + 'pris' : C.g + 'libre'}${C.d}` +
+        `  | ${free} dispo  | ${rate.toFixed(2)} req/s${shape ? `  | forme ${shape}` : ''}${C.x}`
       );
       await sleep(opt.delay + Math.random() * opt.jitter);
     }
@@ -288,6 +398,10 @@ async function main() {
     fs.closeSync(availFd);
   }
   console.log(`\n\nTerminé : ${n} testés, ${free} disponibles → ${availableFile}`);
+  const best = picker.stats().filter((x) => x.free).slice(0, 5);
+  if (best.length) {
+    console.log('Formes les plus rentables : ' + best.map((x) => `${x.pattern} ${x.free}/${x.tried}`).join(' · ') + '  (L=lettre D=chiffre S=_ .)');
+  }
   await sendWebhook(opt.webhook, {
     username: 'Name Scanner',
     content: `🏁 Scan ${stop.requested ? 'interrompu' : 'terminé'} — ${n} testés, **${free}** disponibles.`,
