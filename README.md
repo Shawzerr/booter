@@ -28,7 +28,9 @@ node scanner.js                    # 2 et 3 caractères, toutes combinaisons (a-
 node scanner.js --len 2,3,4        # ajoute les 4 lettres (très long)
 node scanner.js --charset letters  # seulement a-z
 node scanner.js --charset alnum    # lettres + chiffres
-node scanner.js --shuffle          # ordre aléatoire
+node scanner.js --order smart      # défaut : apprend quelles formes de pseudos sont les plus souvent libres
+node scanner.js --order random     # ordre aléatoire uniforme
+node scanner.js --order seq        # ordre alphabétique aaa, aab, aac…
 node scanner.js --help             # toutes les options
 ```
 
