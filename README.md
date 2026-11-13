@@ -40,3 +40,11 @@ node scanner.js --help             # toutes les options
 
 Les résultats sont dans `results/` (`available.txt`, `checked.txt`).
 Ctrl+C arrête proprement ; relancer la commande reprend là où le scan s'était arrêté.
+
+## Rate limit de Discord
+
+Si Discord te limite (attente de plusieurs minutes), le scanner affiche un compte à rebours et ralentit son rythme.
+Pendant l'attente :
+- **change de connexion** (Wi-Fi, partage de connexion…) : il le détecte et reprend tout seul ;
+- **Entrée** : réessaie tout de suite ;
+- **Ctrl+C** : arrête proprement. Ta progression est sauvegardée dans `results/`.

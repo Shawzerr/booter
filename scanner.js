@@ -12,6 +12,8 @@
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
+const readline = require('readline');
 const path = require('path');
 
 // ───────────────────────── .env (optionnel) ─────────────────────────
@@ -244,15 +246,37 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Ralentissement adaptatif : double après chaque rate limit (max x16), redescend peu à peu après chaque succès.
 const pace = { mult: 1 };
 
-/** Attente interruptible par Ctrl+C, avec compte à rebours si `label` est fourni. */
+// Signature du réseau local (adresses IPv4 des interfaces). Si elle change (Wi-Fi -> partage de
+// connexion, VPN, câble…), on sait que l'adresse IP a probablement changé. Rien n'est envoyé sur Internet.
+function netSignature() {
+  const out = [];
+  for (const [name, list] of Object.entries(os.networkInterfaces())) {
+    for (const a of list || []) if (a.family === 'IPv4' && !a.internal) out.push(`${name}:${a.address}`);
+  }
+  return out.sort().join('|');
+}
+const signals = { retryNow: false };
+
+/**
+ * Attente interruptible. Avec `label` (attente de rate limit), elle se termine aussi quand
+ * l'utilisateur appuie sur Entrée ('enter') ou change de connexion ('network').
+ * Ctrl+C l'interrompt toujours.
+ */
 async function wait(ms, stop, label) {
   const end = Date.now() + ms;
+  const sig0 = label ? netSignature() : null;
+  if (label) signals.retryNow = false;
   while (!stop.requested) {
     const left = end - Date.now();
-    if (left <= 0) return;
-    if (label) process.stdout.write(`\r\x1b[K${C.y}! ${label} — reprise dans ${fmtDuration(left / 1000, true)} (Ctrl+C pour arrêter)${C.x}`);
+    if (left <= 0) return undefined;
+    if (label) {
+      if (signals.retryNow) { signals.retryNow = false; return 'enter'; }
+      if (netSignature() !== sig0) return 'network';
+      process.stdout.write(`\r\x1b[K${C.y}! ${label} — reprise dans ${fmtDuration(left / 1000, true)} (Entrée = réessayer maintenant · Ctrl+C = arrêter)${C.x}`);
+    }
     await sleep(Math.min(left, 1000));
   }
+  return undefined;
 }
 
 /** Retourne true (pris) / false (libre). Gère le rate limit (429). */
@@ -280,8 +304,16 @@ async function isTaken(username, stop) {
       const ms = Math.ceil(((body.retry_after ?? Number(res.headers.get('retry-after'))) || 10) * 1000) + 500;
       pace.mult = Math.min(pace.mult * 2, 16);
       log(`rate limit de Discord (${fmtDuration(ms / 1000, true)}) — rythme ralenti x${pace.mult}`);
-      await wait(ms, stop, 'rate limit');
+      if (!isTaken.hinted) {
+        isTaken.hinted = true;
+        log('Astuce : si tu changes de connexion, le scanner le détecte et reprend tout seul (ou appuie sur Entrée).');
+      }
+      const why = await wait(ms, stop, 'rate limit');
       process.stdout.write('\n');
+      if (why) {
+        pace.mult = 1; // nouvelle connexion : on repart à vitesse normale
+        log(why === 'network' ? 'changement de connexion détecté — reprise immédiate' : 'reprise demandée');
+      }
       continue;
     }
     if (res.status === 400) {
@@ -389,6 +421,8 @@ async function main() {
   console.log(`${C.d}Résultats : ${opt.out}   |   Ctrl+C pour arrêter${C.x}\n`);
 
   const stop = { requested: false };
+  const rl = readline.createInterface({ input: process.stdin, terminal: false });
+  rl.on('line', () => { signals.retryNow = true; });
   process.on('SIGINT', () => {
     if (stop.requested) process.exit(1);
     stop.requested = true;
@@ -432,6 +466,7 @@ async function main() {
       await wait((opt.delay + Math.random() * opt.jitter) * pace.mult, stop);
     }
   } finally {
+    rl.close();
     fs.closeSync(checkedFd);
     fs.closeSync(availFd);
   }
